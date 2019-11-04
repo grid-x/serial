@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -14,6 +15,8 @@ import (
 
 // port implements Port interface.
 type port struct {
+	sync.Mutex
+
 	fd         int
 	oldTermios *syscall.Termios
 

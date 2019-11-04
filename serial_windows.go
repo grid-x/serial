@@ -2,10 +2,13 @@ package serial
 
 import (
 	"fmt"
+	"sync"
 	"syscall"
 )
 
 type port struct {
+	sync.Mutex
+
 	handle syscall.Handle
 
 	oldDCB      c_DCB

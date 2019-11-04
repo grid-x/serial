@@ -6,6 +6,7 @@ package serial
 import (
 	"errors"
 	"io"
+	"sync"
 	"time"
 )
 
@@ -50,7 +51,10 @@ type RS485Config struct {
 }
 
 // Port is the interface for controlling serial port.
-type Port io.ReadWriteCloser
+type Port interface {
+	io.ReadWriteCloser
+	sync.Locker
+}
 
 // Open opens a serial port.
 func Open(c *Config) (Port, error) {

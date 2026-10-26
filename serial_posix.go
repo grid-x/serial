@@ -1,3 +1,4 @@
+//go:build darwin || linux || freebsd || openbsd || netbsd
 // +build darwin linux freebsd openbsd netbsd
 
 package serial
@@ -8,17 +9,30 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
 // port implements Port interface.
+//
+// Reads and Writes go through f, i.e. Go's runtime poller (epoll/kqueue) instead of select(2),
+// which only supports fds below FD_SETSIZE (1024): for a higher fd the kernel writes past the
+// fixed-size fd_set on the stack, corrupting it. f also makes Close wake blocked Reads/Writes and
+// keeps the fd open until they have returned, so its number cannot be reused under them.
 type port struct {
+	f *os.File
+	// fd is f's descriptor, for termios and ioctl calls. f.Fd() is not used because it puts the
+	// fd into blocking mode, which disables the poller.
 	fd         int
 	oldTermios *syscall.Termios
 
 	timeout time.Duration
+
+	// closeOnce makes a second Close wait until the first has closed the fd
+	// (os.File.Close would return at once with an error).
+	closeOnce sync.Once
 }
 
 const (
@@ -37,93 +51,165 @@ type rs485_ioctl_opts struct {
 	padding               [5]uint32
 }
 
-// New allocates and returns a new serial port controller.
-func newPort() *port {
-	return &port{fd: -1}
-}
-
 // Open connects to the given serial port.
 func open(c *Config) (Port, error) {
-	p := newPort()
+	p := &port{}
 	termios, err := newTermios(c)
 	if err != nil {
 		return nil, err
 	}
 	// See man termios(3).
 	// O_NOCTTY: no controlling terminal.
-	// O_NDELAY: no data carrier detect.
+	// O_NDELAY: no data carrier detect. It is O_NONBLOCK too, which the runtime poller needs.
 	p.fd, err = syscall.Open(c.Address, syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_NDELAY|syscall.O_CLOEXEC, 0666)
 	if err != nil {
 		return nil, err
+	}
+	p.f = os.NewFile(uintptr(p.fd), c.Address)
+	p.timeout = c.Timeout
+	// Deadlines work only on fds the poller accepted; without it Reads could not time out or be
+	// woken by Close. ptys are accepted; whether any serial driver is rejected is not verified.
+	if err = p.f.SetDeadline(time.Time{}); err != nil {
+		p.f.Close()
+		return nil, fmt.Errorf("serial: %s is not supported by the runtime poller: %v", c.Address, err)
 	}
 	// Backup current termios to restore on closing.
 	p.backupTermios()
 	if err = p.setTermios(termios); err != nil {
 		// No need to restore termios
-		syscall.Close(p.fd)
-		p.fd = -1
 		p.oldTermios = nil
+		p.Close()
 		return nil, err
 	}
 	if err = enableRS485(p.fd, &c.RS485); err != nil {
 		p.Close()
 		return nil, err
 	}
-	p.timeout = c.Timeout
 	return p, nil
 }
 
+// Close closes the port. Blocked Reads and Writes return os.ErrClosed.
 func (p *port) Close() (err error) {
-	if p.fd == -1 {
-		return
-	}
-	p.restoreTermios()
-	err = syscall.Close(p.fd)
-	p.fd = -1
-	p.oldTermios = nil
+	p.closeOnce.Do(func() {
+		// The termios is restored only after f.Close has woken blocked Reads, so none of them can
+		// see the old settings (with VMIN 0 a read without data returns 0, reported as a hangup).
+		// f.Close closes p.fd, so it is restored through a duplicate.
+		fd := -1
+		if p.oldTermios != nil {
+			if fd = dupCloexec(p.fd); fd < 0 {
+				// No fd is free for the duplicate (e.g. EMFILE), so restore it on p.fd now; a
+				// blocked Read may then report a hangup before f.Close wakes it.
+				p.restoreTermios(p.fd)
+			}
+		}
+		err = p.f.Close()
+		if fd >= 0 {
+			p.restoreTermios(fd)
+			syscall.Close(fd)
+		}
+	})
 	return
+}
+
+// dupCloexec returns a close-on-exec duplicate of fd, or -1 if that fails.
+func dupCloexec(fd int) int {
+	// F_DUPFD_CLOEXEC sets close-on-exec atomically, so a concurrent fork cannot inherit the dup.
+	dup, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_DUPFD_CLOEXEC, 0)
+	if errno != 0 {
+		return -1
+	}
+	return int(dup)
 }
 
 // Read reads from serial port. Port must be opened before calling this method.
-// It is blocked until all data received or timeout after p.timeout.
+// It blocks until at least one byte is available or p.timeout expires (ErrTimeout), then returns
+// what has arrived, which may be less than len(b): use io.ReadFull to read a whole frame.
 func (p *port) Read(b []byte) (n int, err error) {
-	var rfds syscall.FdSet
-
-	fd := p.fd
-	fdset(fd, &rfds)
-
-	var tv *syscall.Timeval
 	if p.timeout > 0 {
-		timeout := syscall.NsecToTimeval(p.timeout.Nanoseconds())
-		tv = &timeout
+		// Fails only on a closed port, which Read reports.
+		p.f.SetReadDeadline(time.Now().Add(p.timeout))
 	}
-	for {
-		// If syscall.Select() returns EINTR (Interrupted system call), retry it
-		if err = syscallSelect(fd+1, &rfds, nil, nil, tv); err == nil {
-			break
-		}
-		if err != syscall.EINTR {
-			err = fmt.Errorf("serial: could not select: %v", err)
-			return
-		}
-	}
-	if !fdisset(fd, &rfds) {
-		// Timeout
-		err = ErrTimeout
-		return
-	}
-	n, err = syscall.Read(fd, b)
-	if n == 0 && err == nil {
-		err = io.ErrUnexpectedEOF
-	}
-	return
+	n, err = p.f.Read(b)
+	return n, p.ioErr(err)
 }
 
-// Write writes data to the serial port.
+// Write writes b to the serial port. With a timeout it waits for room in the output queue until
+// all of b is written or the timeout expires (ErrTimeout). Without a timeout it makes a single
+// attempt and never blocks: a full output queue fails with EAGAIN, a partial write with
+// io.ErrShortWrite.
 func (p *port) Write(b []byte) (n int, err error) {
-	n, err = syscall.Write(p.fd, b)
-	return
+	if p.timeout > 0 {
+		// Fails only on a closed port, which Write reports.
+		p.f.SetWriteDeadline(time.Now().Add(p.timeout))
+		n, err = p.f.Write(b)
+		return n, p.ioErr(err)
+	}
+	c, err := p.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	// RawConn.Write keeps the fd open while the func runs; returning true skips the poller wait.
+	if cerr := c.Write(func(fd uintptr) bool {
+		for {
+			n, err = syscall.Write(int(fd), b)
+			if err != syscall.EINTR {
+				return true
+			}
+		}
+	}); cerr != nil {
+		// without a deadline its only error is the port being closed
+		return 0, os.ErrClosed
+	}
+	if n < 0 {
+		n = 0
+	}
+	if err == nil && n < len(b) {
+		err = io.ErrShortWrite
+	}
+	return n, p.ioErr(err)
 }
+
+// ioErr converts a read/write error to the errors Read and Write return: ErrTimeout for an
+// expired deadline, os.ErrClosed for a closed port, a hangupError for a device that went away,
+// and otherwise the bare syscall.Errno (as before the port used os.File). These compare with ==,
+// except a hangupError, which only matches with errors.Is. On a pty whose master was closed,
+// reads return EOF and writes fail with EIO on linux and darwin; a removed real device may fail
+// reads and writes with EIO, ENXIO ("device not configured") or ENODEV depending on the OS and
+// driver (not verified on real hardware).
+//
+// A one-off EIO from a device that is still there is reported as a hangup too, so the caller
+// reconnects; whether a real driver returns one is not verified. Probing the fd cannot tell them
+// apart: tcgetattr still succeeds after a pty hangup on darwin. Callers that need to tell them
+// apart can check the errno with errors.Is.
+func (p *port) ioErr(err error) error {
+	if pe, ok := err.(*os.PathError); ok {
+		err = pe.Err
+	}
+	switch err {
+	case os.ErrDeadlineExceeded:
+		return ErrTimeout
+	case io.EOF, syscall.EIO, syscall.ENXIO, syscall.ENODEV:
+		return &hangupError{name: p.f.Name(), err: err}
+	}
+	return err
+}
+
+// hangupError reports a device that went away. errors.Is matches it with io.ErrUnexpectedEOF,
+// so callers that reconnect on EOF (like modbus) also reconnect on it, and with its cause:
+// io.EOF for a read of 0 bytes, or the errno (e.g. syscall.EIO). Comparing it with == matches
+// neither.
+type hangupError struct {
+	name string
+	err  error
+}
+
+func (e *hangupError) Error() string {
+	return fmt.Sprintf("serial: %s: %v (device hung up)", e.name, e.err)
+}
+
+func (e *hangupError) Is(target error) bool { return target == io.ErrUnexpectedEOF }
+
+func (e *hangupError) Unwrap() error { return e.err }
 
 func (p *port) setTermios(termios *syscall.Termios) (err error) {
 	if err = tcsetattr(p.fd, termios); err != nil {
@@ -145,13 +231,12 @@ func (p *port) backupTermios() {
 	p.oldTermios = oldTermios
 }
 
-// restoreTermios restores backed up termios setting.
-// Make sure that device file has been opened before calling this function.
-func (p *port) restoreTermios() {
+// restoreTermios restores backed up termios setting on fd, an open fd of the device.
+func (p *port) restoreTermios(fd int) {
 	if p.oldTermios == nil {
 		return
 	}
-	if err := tcsetattr(p.fd, p.oldTermios); err != nil {
+	if err := tcsetattr(fd, p.oldTermios); err != nil {
 		// Warning only.
 		log.Printf("serial: could not restore setting: %v\n", err)
 		return
@@ -229,7 +314,10 @@ func newTermios(c *Config) (termios *syscall.Termios, err error) {
 	// Special characters.
 	// VMIN: Minimum number of characters for noncanonical read.
 	// VTIME: Time in deciseconds for noncanonical read.
-	// Both are unused as NDELAY is we utilized when opening device.
+	// With VMIN 0 a read(2) without data returns 0 (EOF) even on the O_NDELAY fd; with VMIN 1
+	// it fails with EAGAIN, so the runtime poller waits for data. Timeouts are p.timeout.
+	termios.Cc[syscall.VMIN] = 1
+	termios.Cc[syscall.VTIME] = 0
 	return
 }
 
